@@ -1,0 +1,20 @@
+[package]
+name = "stim-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Native Rust bindings for the Stim stabilizer circuit simulator."
+repository = "https://github.com/quantumlib/Stim"
+homepage = "https://github.com/quantumlib/Stim"
+readme = "README.md"
+
+[dependencies]
+cxx = "=1.0.182"
+thiserror = "1.0"
+
+[build-dependencies]
+cmake = "0.1"
+cxx-build = "=1.0.182"
+
+[dev-dependencies]
+fusion-blossom = { version = "0.2.12", default-features = false }
