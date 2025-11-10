@@ -3,6 +3,8 @@
 
 #include <limits>
 #include <random>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -13,12 +15,14 @@
 #endif
 
 #include "stim/circuit/circuit.h"
+#include "stim/dem/detector_error_model.h"
 #include "stim/mem/bit_ref.h"
 #include "stim/mem/simd_bit_table.h"
 #include "stim/mem/simd_bits.h"
 #include "stim/mem/simd_bits_range_ref.h"
 #include "stim/simulators/frame_simulator_util.h"
 #include "stim/simulators/tableau_simulator.h"
+#include "stim/util_top/circuit_to_dem.h"
 
 #ifdef __clang__
 #pragma clang diagnostic pop
@@ -28,6 +32,11 @@ using stim::Circuit;
 using stim::CircuitInstruction;
 using stim::GateType;
 using stim::TableauSimulator;
+using stimrs::DemInstructionKind;
+using stimrs::DemInstructionOwned;
+using stimrs::DemTargetKind;
+using stimrs::DemTargetOwned;
+using stimrs::DetectorErrorModelInfo;
 
 namespace {
 
@@ -38,6 +47,21 @@ auto handle_errors(Fn &&fn) {
     } catch (...) {
         throw;
     }
+}
+
+std::string format_coord_list(const std::vector<double> &coords) {
+    std::stringstream ss;
+    ss << "[";
+    bool first = true;
+    for (double value : coords) {
+        if (!first) {
+            ss << ", ";
+        }
+        ss << value;
+        first = false;
+    }
+    ss << "]";
+    return ss.str();
 }
 
 template <size_t W>
@@ -152,6 +176,72 @@ std::mt19937_64 make_rng(const std::optional<uint64_t> &seed) {
     return std::mt19937_64(rd());
 }
 
+DemTargetOwned convert_target(const stim::DemTarget &target) {
+    if (target.is_separator()) {
+        return DemTargetOwned{DemTargetKind::SEPARATOR, 0};
+    }
+    if (target.is_relative_detector_id()) {
+        return DemTargetOwned{DemTargetKind::RELATIVE_DETECTOR_ID, target.val()};
+    }
+    if (target.is_observable_id()) {
+        return DemTargetOwned{DemTargetKind::OBSERVABLE_ID, target.val()};
+    }
+    throw std::invalid_argument("Unrecognized DemTarget.");
+}
+
+DemInstructionKind convert_instruction_kind(stim::DemInstructionType type) {
+    switch (type) {
+        case stim::DemInstructionType::DEM_ERROR:
+            return DemInstructionKind::ERROR;
+        case stim::DemInstructionType::DEM_SHIFT_DETECTORS:
+            return DemInstructionKind::SHIFT_DETECTORS;
+        case stim::DemInstructionType::DEM_DETECTOR:
+            return DemInstructionKind::DETECTOR;
+        case stim::DemInstructionType::DEM_LOGICAL_OBSERVABLE:
+            return DemInstructionKind::LOGICAL_OBSERVABLE;
+        case stim::DemInstructionType::DEM_REPEAT_BLOCK:
+            return DemInstructionKind::REPEAT_BLOCK;
+        default:
+            throw std::invalid_argument("Unknown DemInstructionType.");
+    }
+}
+
+DemInstructionOwned convert_instruction(
+    const stim::DetectorErrorModel &host, const stim::DemInstruction &instruction);
+
+void convert_instruction_list(
+    const stim::DetectorErrorModel &host,
+    const std::vector<stim::DemInstruction> &instructions,
+    rust::Vec<DemInstructionOwned> &out) {
+    for (const auto &inst : instructions) {
+        out.push_back(convert_instruction(host, inst));
+    }
+}
+
+DemInstructionOwned convert_instruction(
+    const stim::DetectorErrorModel &host, const stim::DemInstruction &instruction) {
+    DemInstructionOwned owned;
+    owned.kind = convert_instruction_kind(instruction.type);
+    for (const auto &arg : instruction.arg_data) {
+        owned.args.push_back(arg);
+    }
+    for (const auto &target : instruction.target_data) {
+        owned.targets.push_back(convert_target(target));
+    }
+    owned.tag.reserve(instruction.tag.size());
+    for (char c : instruction.tag) {
+        owned.tag.push_back(static_cast<uint8_t>(c));
+    }
+    if (instruction.type == stim::DemInstructionType::DEM_REPEAT_BLOCK) {
+        owned.repeat_count = instruction.repeat_block_rep_count();
+        const auto &block = instruction.repeat_block_body(host);
+        convert_instruction_list(block, block.instructions, owned.body);
+    } else {
+        owned.repeat_count = 0;
+    }
+    return owned;
+}
+
 }  // namespace
 
 namespace stimrs {
@@ -165,6 +255,9 @@ SamplerHandle::SamplerHandle(
       reference_sample(std::move(ref_sample)),
       skip_reference_sample(skip_ref),
       rng(std::move(rng)) {
+}
+
+DetectorErrorModelHandle::DetectorErrorModelHandle(stim::DetectorErrorModel dem) : dem(std::move(dem)) {
 }
 
 std::unique_ptr<CircuitHandle> circuit_from_text(rust::Str text) {
@@ -282,6 +375,217 @@ SampledDetectionEvents circuit_sample_detection_events(
     });
 }
 
+std::unique_ptr<DetectorErrorModelHandle> detector_error_model_from_text(rust::Str text) {
+    return handle_errors([&]() {
+        stim::DetectorErrorModel dem(std::string(text.data(), text.size()));
+        return std::make_unique<DetectorErrorModelHandle>(std::move(dem));
+    });
+}
+
+std::unique_ptr<DetectorErrorModelHandle> detector_error_model_empty() {
+    return std::make_unique<DetectorErrorModelHandle>(stim::DetectorErrorModel());
+}
+
+std::unique_ptr<DetectorErrorModelHandle> detector_error_model_from_circuit(
+    const CircuitHandle &circuit, bool decompose_errors) {
+    return handle_errors([&]() {
+        stim::DemOptions options;
+        options.decompose_errors = decompose_errors;
+        auto dem = stim::circuit_to_dem(circuit.circuit, options);
+        return std::make_unique<DetectorErrorModelHandle>(std::move(dem));
+    });
+}
+
+std::unique_ptr<DetectorErrorModelHandle> detector_error_model_clone(const DetectorErrorModelHandle &model) {
+    return std::make_unique<DetectorErrorModelHandle>(model.dem);
+}
+
+std::unique_ptr<DetectorErrorModelHandle> detector_error_model_add(
+    const DetectorErrorModelHandle &lhs, const DetectorErrorModelHandle &rhs) {
+    return std::make_unique<DetectorErrorModelHandle>(lhs.dem + rhs.dem);
+}
+
+std::unique_ptr<DetectorErrorModelHandle> detector_error_model_mul(
+    const DetectorErrorModelHandle &model, uint64_t reps) {
+    return std::make_unique<DetectorErrorModelHandle>(model.dem * reps);
+}
+
+std::unique_ptr<DetectorErrorModelHandle> detector_error_model_without_tags(const DetectorErrorModelHandle &model) {
+    return std::make_unique<DetectorErrorModelHandle>(model.dem.without_tags());
+}
+
+std::unique_ptr<DetectorErrorModelHandle> detector_error_model_flattened(const DetectorErrorModelHandle &model) {
+    return std::make_unique<DetectorErrorModelHandle>(model.dem.flattened());
+}
+
+std::unique_ptr<DetectorErrorModelHandle> detector_error_model_rounded(
+    const DetectorErrorModelHandle &model, uint8_t digits) {
+    return std::make_unique<DetectorErrorModelHandle>(model.dem.rounded(digits));
+}
+
+uint64_t detector_error_model_num_detectors(const DetectorErrorModelHandle &model) {
+    return model.dem.count_detectors();
+}
+
+uint64_t detector_error_model_num_observables(const DetectorErrorModelHandle &model) {
+    return model.dem.count_observables();
+}
+
+uint64_t detector_error_model_total_detector_shift(const DetectorErrorModelHandle &model) {
+    return model.dem.total_detector_shift();
+}
+
+rust::String detector_error_model_str(const DetectorErrorModelHandle &model) {
+    return model.dem.str();
+}
+
+DetectorErrorModelInfo detector_error_model_instructions(const DetectorErrorModelHandle &model) {
+    DetectorErrorModelInfo info;
+    convert_instruction_list(model.dem, model.dem.instructions, info.instructions);
+    return info;
+}
+
+DetectorErrorModelInfo detector_error_model_flattened_instructions(const DetectorErrorModelHandle &model) {
+    DetectorErrorModelInfo info;
+    model.dem.iter_flatten_error_instructions([&](const stim::DemInstruction &inst) {
+        info.instructions.push_back(convert_instruction(model.dem, inst));
+    });
+    return info;
+}
+
+bool detector_error_model_eq(const DetectorErrorModelHandle &lhs, const DetectorErrorModelHandle &rhs) {
+    return lhs.dem == rhs.dem;
+}
+
+bool detector_error_model_approx_eq(
+    const DetectorErrorModelHandle &lhs, const DetectorErrorModelHandle &rhs, double atol) {
+    return lhs.dem.approx_equals(rhs.dem, atol);
+}
+
+void detector_error_model_append_error(
+    DetectorErrorModelHandle &model, double probability, rust::Slice<const DemTargetOwned> targets, rust::Str tag) {
+    return handle_errors([&]() {
+        std::vector<stim::DemTarget> converted;
+        converted.reserve(targets.size());
+        for (const auto &t : targets) {
+            switch (t.kind) {
+                case DemTargetKind::RELATIVE_DETECTOR_ID:
+                    converted.push_back(stim::DemTarget::relative_detector_id(t.value));
+                    break;
+                case DemTargetKind::OBSERVABLE_ID:
+                    converted.push_back(stim::DemTarget::observable_id(t.value));
+                    break;
+                case DemTargetKind::SEPARATOR:
+                    converted.push_back(stim::DemTarget::separator());
+                    break;
+            }
+        }
+        model.dem.append_error_instruction(probability, converted, std::string(tag.data(), tag.size()));
+    });
+}
+
+void detector_error_model_append_shift_detectors(
+    DetectorErrorModelHandle &model, rust::Slice<const double> coord_shift, uint64_t detector_shift, rust::Str tag) {
+    return handle_errors([&]() {
+        model.dem.append_shift_detectors_instruction(
+            stim::SpanRef<const double>(coord_shift.data(), coord_shift.data() + coord_shift.size()),
+            detector_shift,
+            std::string(tag.data(), tag.size()));
+    });
+}
+
+void detector_error_model_append_detector(
+    DetectorErrorModelHandle &model, rust::Slice<const double> coords, const DemTargetOwned &target, rust::Str tag) {
+    return handle_errors([&]() {
+        stim::DemTarget converted;
+        switch (target.kind) {
+            case DemTargetKind::RELATIVE_DETECTOR_ID:
+                converted = stim::DemTarget::relative_detector_id(target.value);
+                break;
+            case DemTargetKind::OBSERVABLE_ID:
+                converted = stim::DemTarget::observable_id(target.value);
+                break;
+            case DemTargetKind::SEPARATOR:
+                converted = stim::DemTarget::separator();
+                break;
+        }
+        model.dem.append_detector_instruction(
+            stim::SpanRef<const double>(coords.data(), coords.data() + coords.size()),
+            converted,
+            std::string(tag.data(), tag.size()));
+    });
+}
+
+void detector_error_model_append_logical_observable(
+    DetectorErrorModelHandle &model, const DemTargetOwned &target, rust::Str tag) {
+    return handle_errors([&]() {
+        stim::DemTarget converted;
+        switch (target.kind) {
+            case DemTargetKind::RELATIVE_DETECTOR_ID:
+                converted = stim::DemTarget::relative_detector_id(target.value);
+                break;
+            case DemTargetKind::OBSERVABLE_ID:
+                converted = stim::DemTarget::observable_id(target.value);
+                break;
+            case DemTargetKind::SEPARATOR:
+                converted = stim::DemTarget::separator();
+                break;
+        }
+        model.dem.append_logical_observable_instruction(converted, std::string(tag.data(), tag.size()));
+    });
+}
+
+void detector_error_model_append_repeat_block(
+    DetectorErrorModelHandle &model, uint64_t repeat_count, const DetectorErrorModelHandle &body, rust::Str tag) {
+    return handle_errors([&]() {
+        model.dem.append_repeat_block(repeat_count, body.dem, std::string(tag.data(), tag.size()));
+    });
+}
+
+void detector_error_model_append_from_text(DetectorErrorModelHandle &model, rust::Str text) {
+    return handle_errors([&]() { model.dem.append_from_text(std::string_view(text.data(), text.size())); });
+}
+
+void detector_error_model_append_from_file(DetectorErrorModelHandle &model, rust::Str path) {
+    return handle_errors([&]() {
+        auto file = std::fopen(std::string(path.data(), path.size()).c_str(), "rb");
+        if (file == nullptr) {
+            throw std::runtime_error("failed to open DEM file");
+        }
+        model.dem.append_from_file(file);
+        std::fclose(file);
+    });
+}
+
+DemTargetOwned dem_target_relative_detector(uint64_t id) {
+    return DemTargetOwned{DemTargetKind::RELATIVE_DETECTOR_ID, id};
+}
+
+DemTargetOwned dem_target_observable(uint64_t id) {
+    return DemTargetOwned{DemTargetKind::OBSERVABLE_ID, id};
+}
+
+DemTargetOwned dem_target_separator() {
+    return DemTargetOwned{DemTargetKind::SEPARATOR, 0};
+}
+
+DemTargetOwned dem_target_shift(const DemTargetOwned &target, int64_t offset) {
+    stim::DemTarget converted;
+    switch (target.kind) {
+        case DemTargetKind::RELATIVE_DETECTOR_ID:
+            converted = stim::DemTarget::relative_detector_id(target.value);
+            break;
+        case DemTargetKind::OBSERVABLE_ID:
+            converted = stim::DemTarget::observable_id(target.value);
+            break;
+        case DemTargetKind::SEPARATOR:
+            converted = stim::DemTarget::separator();
+            break;
+    }
+    converted.shift_if_detector_id(offset);
+    return convert_target(converted);
+}
+
 std::unique_ptr<CircuitHandle> circuit_surface_code(
     uint64_t rounds,
     uint32_t distance,
@@ -337,6 +641,79 @@ rust::Vec<uint8_t> sampler_sample_bit_packed(SamplerHandle &sampler, uint64_t sh
 
 void sampler_reseed(SamplerHandle &sampler, uint64_t seed) {
     sampler.rng.seed(seed);
+}
+
+rust::Vec<DemDetectorCoordinates> detector_error_model_get_detector_coordinates(
+    const DetectorErrorModelHandle &model, rust::Vec<uint64_t> included) {
+    return handle_errors([&]() {
+        rust::Vec<DemDetectorCoordinates> out;
+        std::set<uint64_t> indices;
+        if (included.size() == 0) {
+            auto total = model.dem.count_detectors();
+            for (uint64_t k = 0; k < total; k++) {
+                indices.insert(k);
+            }
+        } else {
+            auto *ptr = included.data();
+            for (size_t k = 0; k < included.size(); k++) {
+                indices.insert(ptr[k]);
+            }
+        }
+        auto coords = model.dem.get_detector_coordinates(indices);
+        for (auto &entry : coords) {
+            DemDetectorCoordinates row;
+            row.detector = entry.first;
+            for (double value : entry.second) {
+                row.coords.push_back(value);
+            }
+            out.push_back(std::move(row));
+        }
+        return out;
+    });
+}
+
+DetectorFinalShift detector_error_model_final_detector_and_coord_shift(const DetectorErrorModelHandle &model) {
+    return handle_errors([&]() {
+        auto result = model.dem.final_detector_and_coord_shift();
+        DetectorFinalShift shift;
+        shift.detector_shift = result.first;
+        for (double value : result.second) {
+            shift.coord_shift.push_back(value);
+        }
+        return shift;
+    });
+}
+
+rust::String detector_error_model_layout_str(const DetectorErrorModelHandle &model) {
+    return handle_errors([&]() {
+        std::stringstream ss;
+        ss << "# detector layout\n";
+        std::set<uint64_t> include;
+        auto total = model.dem.count_detectors();
+        for (uint64_t k = 0; k < total; k++) {
+            include.insert(k);
+        }
+        auto coords = model.dem.get_detector_coordinates(include);
+        if (coords.empty()) {
+            ss << "# (no detectors)\n";
+        } else {
+            for (const auto &entry : coords) {
+                ss << "D" << entry.first << " " << format_coord_list(entry.second) << "\n";
+            }
+        }
+        return ss.str();
+    });
+}
+
+rust::String detector_error_model_hint_str(const DetectorErrorModelHandle &model) {
+    return handle_errors([&]() {
+        auto result = model.dem.final_detector_and_coord_shift();
+        std::stringstream ss;
+        ss << "# total_detectors " << model.dem.count_detectors() << "\n";
+        ss << "# detector_shift " << result.first << "\n";
+        ss << "# coord_shift " << format_coord_list(result.second) << "\n";
+        return ss.str();
+    });
 }
 
 }  // namespace stimrs
